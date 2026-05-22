@@ -1,28 +1,46 @@
-const BASE = 'https://api.clickup.com/api/v2';
+import axios from 'axios';
 
 function client(token) {
   if (!token) throw new Error('CLICKUP_TOKEN não definido');
-  return async function request(path, { method = 'GET', body, query } = {}) {
-    const url = new URL(BASE + path);
-    if (query) for (const [k, v] of Object.entries(query)) {
-      if (v === undefined || v === null) continue;
-      if (Array.isArray(v)) v.forEach((x) => url.searchParams.append(k + '[]', x));
-      else url.searchParams.set(k, String(v));
-    }
-    const res = await fetch(url, {
-      method,
-      headers: {
-        Authorization: token,
-        'Content-Type': 'application/json',
+
+  const http = axios.create({
+    baseURL: 'https://api.clickup.com/api/v2',
+    headers: {
+      Authorization: token,
+      'Content-Type': 'application/json',
+    },
+    paramsSerializer: {
+      serialize(params) {
+        const sp = new URLSearchParams();
+        for (const [k, v] of Object.entries(params)) {
+          if (v === undefined || v === null) continue;
+          if (Array.isArray(v)) v.forEach((x) => sp.append(k + '[]', x));
+          else sp.set(k, String(v));
+        }
+        return sp.toString();
       },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`ClickUp ${method} ${path} ${res.status}: ${text}`);
+    },
+  });
+
+  return async function request(path, { method = 'GET', body, query } = {}) {
+    try {
+      const res = await http.request({
+        url: path,
+        method,
+        params: query,
+        data: body,
+      });
+      return res.data ?? null;
+    } catch (err) {
+      if (err.response) {
+        const text =
+          typeof err.response.data === 'string'
+            ? err.response.data
+            : JSON.stringify(err.response.data);
+        throw new Error(`ClickUp ${method} ${path} ${err.response.status}: ${text}`);
+      }
+      throw err;
     }
-    if (res.status === 204) return null;
-    return res.json();
   };
 }
 
@@ -80,9 +98,7 @@ export function createClickUp(token) {
 
     async listTasksVisibleInList(listId) {
       const views = await this.getListViews(listId);
-      // ClickUp default list view is usually the first "list" type view
-      const view =
-        views.find((v) => v.type === 'list') ?? views[0];
+      const view = views.find((v) => v.type === 'list') ?? views[0];
       if (!view) return [];
       return this.listTasksInView(view.id);
     },
