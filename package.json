@@ -1,0 +1,21 @@
+{
+  "name": "sprint version manager",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "cvm": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^7.2.0",
+    "@octokit/rest": "^21.0.2",
+    "dotenv": "^16.4.7",
+    "p-limit": "^6.2.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
