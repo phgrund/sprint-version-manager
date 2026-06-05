@@ -26,6 +26,11 @@ export function createGitHub(token) {
       return { sha: b.commit.sha, defaultBranch: r.default_branch };
     },
 
+    async getBranchSha(owner, repo, branch) {
+      const { data } = await octokit.repos.getBranch({ owner, repo, branch });
+      return data.commit.sha;
+    },
+
     async createBranch(owner, repo, branch, fromSha) {
       await octokit.git.createRef({
         owner,

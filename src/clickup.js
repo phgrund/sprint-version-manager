@@ -127,5 +127,10 @@ export function createClickUp(token) {
     async getTask(taskId) {
       return req(`/task/${taskId}`);
     },
+
+    async getTaskSubtasks(taskId) {
+      const data = await req(`/task/${taskId}`, { query: { include_subtasks: true } });
+      return data?.subtasks ?? [];
+    },
   };
 }

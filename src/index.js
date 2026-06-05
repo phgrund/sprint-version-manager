@@ -5,8 +5,7 @@ import pLimit from 'p-limit';
 import { createClickUp } from './clickup.js';
 import { createGitHub } from './github.js';
 
-const TARGET_STATUSES = ['completed', 'testing', 'validated code', 'code review'];
-const PR_STATUSES = new Set(['validated code', 'code review']);
+const PR_SKIP_STATUSES = new Set(['testing', 'completed']);
 const ACCEPTED_TAGS = new Set(['📝 story', '🔧 ajuste previsto']);
 const VERSION_FIELD_NAME = '🚀 versão';
 const PR_REGEX = /(?:https?:\/\/)?github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/gi;
@@ -80,6 +79,7 @@ async function main() {
     CLICKUP_TOKEN,
     CLICKUP_SPRINTS_FOLDER_ID,
     GITHUB_TOKEN,
+    GITHUB_RELEASE_REPOS,
   } = process.env;
 
   if (!CLICKUP_TOKEN || !CLICKUP_SPRINTS_FOLDER_ID || !GITHUB_TOKEN) {
@@ -87,9 +87,56 @@ async function main() {
     process.exit(1);
   }
 
+  const releaseRepos = (GITHUB_RELEASE_REPOS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
   const cu = createClickUp(CLICKUP_TOKEN);
   const gh = createGitHub(GITHUB_TOKEN);
   const limit = pLimit(5);
+
+  // Etapa 0 — versão (perguntada logo no início) + garantir branch release/X.Y
+  const version = await input({
+    message: 'Versão (ex.: 1.60):',
+    validate: (v) => /^\d+\.\d+$/.test(v.trim()) || 'Use formato MAJOR.MINOR (ex.: 1.60)',
+  });
+  const versionTrim = version.trim();
+  const releaseBranch = `release/${versionTrim}`;
+
+  if (!releaseRepos.length) {
+    console.log('GITHUB_RELEASE_REPOS não definido — pulando verificação da branch de release.');
+  } else {
+    console.log(`\nVerificando branch "${releaseBranch}" nos repos de release...`);
+    for (const key of releaseRepos) {
+      const [owner, repo] = key.split('/');
+      if (!owner || !repo) {
+        console.log(`  ⚠ entrada inválida em GITHUB_RELEASE_REPOS: "${key}" (use owner/repo)`);
+        continue;
+      }
+      try {
+        if (await gh.branchExists(owner, repo, releaseBranch)) {
+          console.log(`  ✓ ${key}: ${releaseBranch} já existe`);
+          continue;
+        }
+      } catch (err) {
+        console.log(`  ✗ ${key}: falha ao verificar branch — ${err.message}`);
+        continue;
+      }
+      const create = await confirm({
+        message: `Branch "${releaseBranch}" não existe em ${key}. Criar a partir de develop?`,
+        default: true,
+      });
+      if (!create) continue;
+      try {
+        const sha = await gh.getBranchSha(owner, repo, 'develop');
+        await gh.createBranch(owner, repo, releaseBranch, sha);
+        console.log(`  criada ${releaseBranch} em ${key} a partir de develop`);
+      } catch (err) {
+        console.log(`  ✗ ${key}: falha ao criar branch — ${err.message}`);
+      }
+    }
+  }
 
   // Etapa 1 — escolher sprint(s) = list(s) da pasta Sprints
   console.log('Carregando sprints...');
@@ -114,13 +161,7 @@ async function main() {
     })),
   });
 
-  // Etapa 2 — versão + resolver opção do dropdown
-  const version = await input({
-    message: 'Versão (ex.: 1.60):',
-    validate: (v) => /^\d+\.\d+$/.test(v.trim()) || 'Use formato MAJOR.MINOR (ex.: 1.60)',
-  });
-  const versionTrim = version.trim();
-
+  // Etapa 2 — resolver opção do dropdown da versão (já informada na Etapa 0)
   const fields = await cu.listAccessibleCustomFields(selectedSprintListIds[0]);
   const versionField = fields.find(
     (f) => (f.name ?? '').toLowerCase() === VERSION_FIELD_NAME,
@@ -150,11 +191,13 @@ async function main() {
   for (const arr of tasksBySprint) for (const t of arr) tasksById.set(t.id, t);
   const allTasks = [...tasksById.values()];
 
+  // Sem filtro por status: todo story (com tag aceita e versão vazia ou já igual)
+  // é candidato, independente do status.
   const candidates = allTasks.filter((t) => {
     if (!hasAcceptedTag(t)) return false;
     const vf = findVersionField(t);
     if (!isVersionEmpty(vf) && !versionMatches(vf, option)) return false;
-    return TARGET_STATUSES.includes(normStatus(t.status?.status));
+    return true;
   });
 
   if (!candidates.length) {
@@ -162,27 +205,46 @@ async function main() {
     return;
   }
 
-  // Etapa 3 — agrupar e selecionar
-  console.log('\nResumo por status:');
-  const grouped = new Map(TARGET_STATUSES.map((s) => [s, []]));
+  // Etapa 3 — agrupar por status (todos os status presentes, ordenados pelo
+  // orderindex do status) e selecionar status por status, acumulando.
+  const statusMeta = new Map(); // normStatus -> { color, orderindex }
+  for (const t of candidates) {
+    const s = normStatus(t.status?.status);
+    if (!statusMeta.has(s)) {
+      statusMeta.set(s, {
+        color: t.status?.color,
+        orderindex: Number(t.status?.orderindex ?? Number.MAX_SAFE_INTEGER),
+      });
+    }
+  }
+  const orderedStatuses = [...statusMeta.keys()].sort(
+    (a, b) => statusMeta.get(a).orderindex - statusMeta.get(b).orderindex,
+  );
+
+  const grouped = new Map(orderedStatuses.map((s) => [s, []]));
   for (const t of candidates) grouped.get(normStatus(t.status.status)).push(t);
-  for (const s of TARGET_STATUSES) {
-    const arr = grouped.get(s);
-    console.log(`  [${s}] ${arr.length}`);
-    for (const t of arr) console.log(`    - ${t.id}  ${t.name}`);
+
+  console.log('\nResumo por status:');
+  for (const s of orderedStatuses) {
+    console.log(`  [${colorize(s, statusMeta.get(s).color)}] ${grouped.get(s).length}`);
   }
   console.log('');
 
-  const orderedTasks = TARGET_STATUSES.flatMap((s) => grouped.get(s));
-  const selectedIds = await checkbox({
-    message: 'Quais tarefas entram nesta versão?',
-    pageSize: 20,
-    choices: orderedTasks.map((t) => ({
-      name: `[${colorize(normStatus(t.status.status), t.status.color)}] ${t.id} — ${t.name}`,
-      value: t.id,
-      checked: versionMatches(findVersionField(t), option),
-    })),
-  });
+  const orderedTasks = orderedStatuses.flatMap((s) => grouped.get(s));
+  const selectedIds = [];
+  for (const s of orderedStatuses) {
+    const arr = grouped.get(s);
+    const picked = await checkbox({
+      message: `[${colorize(s, statusMeta.get(s).color)}] (${arr.length}) — quais entram na versão ${versionTrim}?`,
+      pageSize: 20,
+      choices: arr.map((t) => ({
+        name: `${t.id} — ${t.name}`,
+        value: t.id,
+        checked: versionMatches(findVersionField(t), option),
+      })),
+    });
+    selectedIds.push(...picked);
+  }
 
   if (!selectedIds.length) {
     console.log('Nada selecionado. Abortando.');
@@ -243,19 +305,37 @@ async function main() {
   }
 
   // Etapa 5 — extrair PRs dos comentários
-  const prTasks = selectedTasks.filter((t) => PR_STATUSES.has(normStatus(t.status.status)));
+  const prTasks = selectedTasks.filter((t) => !PR_SKIP_STATUSES.has(normStatus(t.status.status)));
   if (!prTasks.length) {
-    console.log('Nenhuma tarefa em code review/validated code. Concluído.');
+    console.log('Nenhuma tarefa fora de testing/completed. Concluído.');
     return;
   }
 
-  console.log(`\nVarrendo comentários de ${prTasks.length} tarefa(s) por PRs...`);
-  const prRefs = new Map(); // key=owner/repo#n -> { owner, repo, number, taskIds:[] }
+  // PRs costumam estar nas subtarefas das stories, não na story em si.
+  // Para cada story, varremos a própria + todas as subtarefas.
+  console.log(`\nColetando subtarefas de ${prTasks.length} tarefa(s)...`);
+  const scanTargets = []; // { id, storyId }
   await Promise.all(
     prTasks.map((t) =>
       limit(async () => {
-        const comments = await cu.getTaskComments(t.id);
-        const parts = [t.description ?? '', t.text_content ?? ''];
+        scanTargets.push({ id: t.id, storyId: t.id });
+        try {
+          const subs = await cu.getTaskSubtasks(t.id);
+          for (const st of subs) scanTargets.push({ id: st.id, storyId: t.id });
+        } catch (err) {
+          console.log(`  falhou subtarefas de ${t.id}: ${err.message}`);
+        }
+      }),
+    ),
+  );
+
+  console.log(`Varrendo comentários de ${scanTargets.length} tarefa(s)/subtarefa(s) por PRs...`);
+  const prRefs = new Map(); // key=owner/repo#n -> { owner, repo, number, taskIds:[] }
+  await Promise.all(
+    scanTargets.map(({ id, storyId }) =>
+      limit(async () => {
+        const comments = await cu.getTaskComments(id);
+        const parts = [];
         for (const c of comments) {
           parts.push(c.comment_text ?? '');
           for (const block of c.comment ?? []) {
@@ -279,7 +359,9 @@ async function main() {
               taskIds: [],
             });
           }
-          prRefs.get(key).taskIds.push(t.id);
+          if (!prRefs.get(key).taskIds.includes(storyId)) {
+            prRefs.get(key).taskIds.push(storyId);
+          }
         }
       }),
     ),
@@ -318,7 +400,6 @@ async function main() {
   }
 
   // Etapa 6 — selecionar PRs e trocar base
-  const releaseBranch = `release/${versionTrim}`;
   const selectedPRKeys = await checkbox({
     message: `PRs para mudar base para "${releaseBranch}":`,
     pageSize: 20,
@@ -350,7 +431,7 @@ async function main() {
       continue;
     }
     const create = await confirm({
-      message: `Branch "${releaseBranch}" não existe em ${key}. Criar a partir da default?`,
+      message: `Branch "${releaseBranch}" não existe em ${key}. Criar a partir de develop?`,
       default: true,
     });
     if (!create) {
@@ -358,9 +439,9 @@ async function main() {
       continue;
     }
     try {
-      const { sha, defaultBranch } = await gh.getDefaultBranchSha(owner, repo);
+      const sha = await gh.getBranchSha(owner, repo, 'develop');
       await gh.createBranch(owner, repo, releaseBranch, sha);
-      console.log(`  criada ${releaseBranch} em ${key} a partir de ${defaultBranch}`);
+      console.log(`  criada ${releaseBranch} em ${key} a partir de develop`);
       repoBranchOk.set(key, true);
     } catch (err) {
       console.log(`  falhou criar branch em ${key}: ${err.message}`);
