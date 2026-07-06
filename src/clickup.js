@@ -97,8 +97,11 @@ export function createClickUp(token) {
     },
 
     async listTasksVisibleInList(listId) {
-      const views = await this.getListViews(listId);
-      const view = views.find((v) => v.type === 'list') ?? views[0];
+      const data = await req(`/list/${listId}/view`);
+      const view =
+        data.required_views?.list ??
+        (data.views ?? []).find((v) => v.type === 'list') ??
+        null;
       if (!view) return [];
       return this.listTasksInView(view.id);
     },
